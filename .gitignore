@@ -1,0 +1,16 @@
+# 测试输出文件
+*_测试拆解*.xlsx
+*_测试拆解*_已修复.xlsx
+*_验证无膨胀.xlsx
+
+# WorkBuddy 内部目录
+.workbuddy/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
