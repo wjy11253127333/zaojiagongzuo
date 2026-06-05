@@ -22,6 +22,8 @@
 import os
 import re
 import sys
+import shutil
+from copy import copy as _copy_obj
 import pandas as pd
 import openpyxl
 from openpyxl.styles import (
@@ -37,7 +39,7 @@ from audit_logger import AuditLogger   # 新增：导入审计日志器
 LIST_KEYWORDS    = ["项目特征", "项目名称", "项目编码", "计量单位", "工程量"]
 MIN_HIT          = 4
 OUTPUT_SHEET     = "清单合并"    # 原："清单汇总"
-REPORT_SHEET     = "操作记录"    # 原："合并说明"
+REPORT_SHEET     = "合并说明"    # 原："操作记录"（列审计报告：同名列/异名列/空列分析）
 
 # 样式常量
 THIN_BORDER = Border(
@@ -350,6 +352,57 @@ def _apply_report_formatting(ws, report_df: pd.DataFrame):
 
 
 # ============================================================
+# Sheet 复制工具（Step 6 多文件合并用）
+# ============================================================
+
+def _copy_sheet(src_wb, src_sheet_name: str, dst_wb, dst_sheet_name: str):
+    """
+    将源工作簿中的 Sheet 复制到目标工作簿（手动逐格复制）。
+
+    Args:
+        src_wb:          源 openpyxl Workbook
+        src_sheet_name:  源 Sheet 名称
+        dst_wb:          目标 openpyxl Workbook
+        dst_sheet_name:  目标 Sheet 名称
+    """
+    ws_src = src_wb[src_sheet_name]
+    ws_dst = dst_wb.create_sheet(dst_sheet_name)
+
+    # 复制单元格值 + 样式
+    for row in ws_src.iter_rows(min_row=1, max_row=ws_src.max_row,
+                                 min_col=1, max_col=ws_src.max_column):
+        for cell in row:
+            dst_cell = ws_dst.cell(row=cell.row, column=cell.column, value=cell.value)
+            if cell.has_style:
+                try:
+                    dst_cell.font = _copy_obj(cell.font)
+                    dst_cell.fill = _copy_obj(cell.fill)
+                    dst_cell.border = _copy_obj(cell.border)
+                    dst_cell.alignment = _copy_obj(cell.alignment)
+                    dst_cell.number_format = cell.number_format
+                except Exception:
+                    pass
+
+    # 复制列宽
+    for col_letter, col_dim in ws_src.column_dimensions.items():
+        if col_dim.width:
+            ws_dst.column_dimensions[col_letter].width = col_dim.width
+
+    # 复制行高
+    for row_num, row_dim in ws_src.row_dimensions.items():
+        if row_dim.height:
+            ws_dst.row_dimensions[row_num].height = row_dim.height
+
+    # 复制合并单元格
+    for merged_range in ws_src.merged_cells.ranges:
+        ws_dst.merge_cells(str(merged_range))
+
+    # 复制冻结窗格
+    if ws_src.freeze_panes:
+        ws_dst.freeze_panes = ws_src.freeze_panes
+
+
+# ============================================================
 # 主处理函数（多文件版本）
 # ============================================================
 
@@ -539,6 +592,13 @@ def merge_sheets(
 
     merged = pd.concat(all_dfs, join="outer", ignore_index=True, sort=False)
 
+    # 删除全空行（整行所有列都是 NaN），避免表头后出现空行
+    before_drop = len(merged)
+    merged.dropna(how="all", inplace=True)
+    merged.reset_index(drop=True, inplace=True)
+    if len(merged) < before_drop:
+        print(f"  [INFO] 已删除 {before_drop - len(merged)} 行全空数据")
+
     # 显式重排列序：同名列按基准表顺序，差异列追加到末尾
     extra_columns = [c for c in merged.columns if c not in base_columns]
     merged = merged[base_columns + extra_columns]
@@ -585,12 +645,106 @@ def merge_sheets(
         output_path = f"{base}_v{counter}{ext}"
         counter += 1
 
-    # ---- Step 6：写入 Excel（独立新文件）----
+    # ---- Step 6：写入 Excel（保留原始 Sheet + 新增合并结果）----
     try:
-        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        import tempfile
+
+        # 确定基础文件（第一个成功处理的文件）
+        base_file = processed_files[0] if processed_files else input_files[0]
+
+        # 确保输出目录存在
+        out_dir = os.path.dirname(output_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        # 复制基础文件到输出路径（保留所有原始 Sheet）
+        if os.path.abspath(base_file) != os.path.abspath(output_path):
+            shutil.copy2(base_file, output_path)
+
+        # 用 openpyxl 加载输出文件，准备追加其他文件的 Sheet 和新 Sheet
+        wb = openpyxl.load_workbook(output_path)
+
+        # ---- 多文件支持：从第二个文件开始复制 Sheet 到输出文件 ----
+        for other_file in input_files[1:]:
+            if not os.path.isfile(other_file):
+                continue
+            try:
+                wb_other = openpyxl.load_workbook(other_file, data_only=True)
+            except Exception as e:
+                print(f"  [WARN] 无法打开 {os.path.basename(other_file)}: {e}")
+                continue
+
+            for sn in wb_other.sheetnames:
+                if sn in (OUTPUT_SHEET, REPORT_SHEET):
+                    continue
+
+                ws_new = wb_other[sn]
+                new_name = sn
+
+                # 冲突检测：表头对比
+                if sn in wb.sheetnames:
+                    ws_existing = wb[sn]
+
+                    # 获取两个 Sheet 的表头行
+                    hdr_row_existing = get_header_row(ws_existing)
+                    hdr_row_new = get_header_row(ws_new)
+
+                    if hdr_row_existing is not None and hdr_row_new is not None:
+                        headers_existing = [
+                            str(ws_existing.cell(row=hdr_row_existing, column=c).value or "").strip()
+                            for c in range(1, min(ws_existing.max_column + 1, 50))
+                        ]
+                        headers_new = [
+                            str(ws_new.cell(row=hdr_row_new, column=c).value or "").strip()
+                            for c in range(1, min(ws_new.max_column + 1, 50))
+                        ]
+
+                        # 去除尾部空列
+                        while headers_existing and not headers_existing[-1]:
+                            headers_existing.pop()
+                        while headers_new and not headers_new[-1]:
+                            headers_new.pop()
+
+                        if headers_existing == headers_new:
+                            print(f"  [WARN] 疑似重复上传：Sheet「{sn}」"
+                                  f"在 {os.path.basename(base_file)} 与 {os.path.basename(other_file)} "
+                                  f"中表头完全相同，已跳过")
+                            audit_logger.log_error(
+                                "Sheet冲突",
+                                f"表头相同，跳过重复 Sheet「{sn}」（来源：{os.path.basename(other_file)}）",
+                                remark="建议检查是否重复上传同一文件",
+                            )
+                            continue
+                        else:
+                            # 表头不同，重命名（D3-A 规则）
+                            file_short = os.path.basename(other_file).split("_type")[0].split(".")[0]
+                            new_name = f"{sn}({file_short})"
+                            counter = 1
+                            while new_name in wb.sheetnames:
+                                new_name = f"{sn}({file_short})_{counter}"
+                                counter += 1
+                            print(f"  [INFO] Sheet「{sn}」重命名为「{new_name}」（表头不同）")
+
+                # 复制 Sheet（手动复制单元格）
+                _copy_sheet(wb_other, sn, wb, new_name)
+
+            wb_other.close()
+
+        # 若已存在同名目标 Sheet，先删除（覆盖模式）
+        for sheet_name in (OUTPUT_SHEET, REPORT_SHEET):
+            if sheet_name in wb.sheetnames:
+                del wb[sheet_name]
+
+        # 保存并关闭（保留原始 Sheet 的状态），然后用 pandas 追加新 Sheet
+        wb.save(output_path)
+        wb.close()
+
+        # 用 pandas 写 merged + report_df（追加模式）
+        with pd.ExcelWriter(
+            output_path, engine="openpyxl", mode="a", if_sheet_exists="replace"
+        ) as writer:
             merged.to_excel(writer, sheet_name=OUTPUT_SHEET, index=False)
-            audit_df = audit_logger.get_dataframe()
-            audit_df.to_excel(writer, sheet_name=REPORT_SHEET, index=False)
+            report_df.to_excel(writer, sheet_name=REPORT_SHEET, index=False)
 
         # 格式标准化
         wb = openpyxl.load_workbook(output_path)
@@ -599,12 +753,14 @@ def merge_sheets(
         _apply_list_merge_formatting(ws_output)
 
         ws_report = wb[REPORT_SHEET]
-        _apply_report_formatting(ws_report, audit_logger.get_dataframe())
+        _apply_report_formatting(ws_report, report_df)
 
         wb.save(output_path)
         wb.close()
 
-        print(f"\n[OK] 已保存到独立文件：{os.path.basename(output_path)}")
+        original_sheet_count = len(openpyxl.load_workbook(output_path).sheetnames) - 2
+        print(f"\n[OK] 已保存到：{os.path.basename(output_path)}")
+        print(f"       原始清单表已保留（{original_sheet_count} 个 Sheet）")
         audit_logger.log_output(output_path, [OUTPUT_SHEET, REPORT_SHEET])
         audit_logger.log_format_apply(OUTPUT_SHEET)
         audit_logger.log_format_apply(REPORT_SHEET)
@@ -621,7 +777,7 @@ def merge_sheets(
     print(f"  输入文件：{len(processed_files)} 个")
     print(f"  输出：{os.path.basename(output_path)}")
     print(f"  Sheets：{OUTPUT_SHEET} ({merged.shape[0]}行x{merged.shape[1]}列)")
-    print(f"         {REPORT_SHEET} ({len(audit_logger.records)} 条记录)")
+    print(f"         {REPORT_SHEET} ({len(report_df)} 行)")
     print(f"{'='*60}\n")
 
     return {
