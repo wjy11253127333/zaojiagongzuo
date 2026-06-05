@@ -411,15 +411,18 @@ def merge_sheets(
     output_path: str | None = None,
     audit_logger: "AuditLogger | None" = None,
     prefer_flat: bool = True,       # Phase 1 新增：优先使用 _type_v2 预处理文件
+    original_file: str | None = None,  # v1.3：原始未处理文件的路径（用于保留真正的原始清单表）
 ):
     """
     主处理函数（多文件版）：
         扫描所有输入文件 → 识别清单表 → 加业态列 → 合并 → 格式标准化 → 写操作记录
 
     Args:
-        input_files:  Excel 文件路径列表（支持1个或多个文件）
-        output_path:  输出文件路径（为 None 时自动生成）
-        audit_logger: AuditLogger 实例（为 None 时内部新建）
+        input_files:    Excel 文件路径列表（支持1个或多个文件）
+        output_path:    输出文件路径（为 None 时自动生成）
+        audit_logger:   AuditLogger 实例（为 None 时内部新建）
+        prefer_flat:    是否优先使用 _type_v2 预处理文件
+        original_file:  真正的原始文件路径（用于在输出中保留含多级表头的原始清单表）
 
     Returns:
         dict: {"list_sheets", "output_file", "rows", "cols", "dropped_cols"}
@@ -509,7 +512,7 @@ def merge_sheets(
             # 用 pandas 读数据
             try:
                 if is_flat:
-                    # Flat 文件：openpyxl 手读单级表头 + pandas 纯读数据
+                    # Flat 文件：openpyxl 手读单级表头 + 手读数据（避 pd.read_excel bug）
                     headers_list = [
                         str(ws.cell(row=hdr_row, column=c).value or "").strip()
                         for c in range(1, ws.max_column + 1)
@@ -518,14 +521,16 @@ def merge_sheets(
                     while headers_list and not headers_list[-1]:
                         headers_list.pop()
 
-                    # 跳过标题行+表头行，纯读数据
-                    df = pd.read_excel(
-                        file_path, sheet_name=sn,
-                        header=None,
-                        skiprows=range(1, hdr_row + 1),
-                    )
-                    # 手动设置列名（openpyxl 读取的单级表头）
-                    df.columns = headers_list[:len(df.columns)]
+                    # 用手动逐格读取数据（pd.read_excel 对某些单元格返回 nan）
+                    data = []
+                    for row_idx in range(hdr_row + 1, ws.max_row + 1):
+                        row_data = [
+                            ws.cell(row=row_idx, column=c).value
+                            for c in range(1, len(headers_list) + 1)
+                        ]
+                        data.append(row_data)
+                    df = pd.DataFrame(data, columns=headers_list)
+                    del data  # 释放内存
                 else:
                     # 原始文件：使用原有逻辑
                     df = pd.read_excel(
@@ -548,6 +553,15 @@ def merge_sheets(
             for col in list(df.columns):
                 if _is_header_duplicate(df, col):
                     df = df[df[col] != col]
+
+            # 增项列来源标注：增项_N → 增项_N_Sheet名
+            rename_map = {}
+            for col in df.columns:
+                if str(col).startswith("增项_"):
+                    rename_map[col] = f"{col}_{sn}"
+            if rename_map:
+                df.rename(columns=rename_map, inplace=True)
+                print(f"          增项列来源标注：{list(rename_map.values())}")
 
             # 加业态列（值 = 工作表全名）
             # Phase 1：如果 flat 文件已含业态列，不重复插入
@@ -592,12 +606,49 @@ def merge_sheets(
 
     merged = pd.concat(all_dfs, join="outer", ignore_index=True, sort=False)
 
-    # 删除全空行（整行所有列都是 NaN），避免表头后出现空行
+    # 删除无效行（避免表头后出现空行）
+    # 策略：
+    #   - 删除「项目编码」为空 且 「项目名称」为空的行（真正无意义空行）
+    #   - 保留分部标题行（如"土石方工程"，项目名称有值但项目编码为空）
     before_drop = len(merged)
-    merged.dropna(how="all", inplace=True)
-    merged.reset_index(drop=True, inplace=True)
-    if len(merged) < before_drop:
-        print(f"  [INFO] 已删除 {before_drop - len(merged)} 行全空数据")
+
+    if "项目编码" in merged.columns and "项目名称" in merged.columns:
+        # 项目编码 非空（有值） → 保留
+        cond_code_ok = merged["项目编码"].notna() & (
+            merged["项目编码"].astype(str).str.strip().ne("")
+        )
+        # 项目名称 非空（分部标题行） → 保留
+        cond_name_ok = merged["项目名称"].notna() & (
+            merged["项目名称"].astype(str).str.strip().ne("")
+        )
+        # 任一条件满足即保留
+        mask = cond_code_ok | cond_name_ok
+        removed = before_drop - mask.sum()
+        if removed > 0:
+            print(f"  [INFO] 已删除 {int(removed)} 行（项目编码和项目名称均为空）")
+        merged = merged[mask].reset_index(drop=True)
+    else:
+        # 降级：只按关键列判断
+        key_col = None
+        for candidate in ["项目编码", "序号"]:
+            if candidate in merged.columns:
+                key_col = candidate
+                break
+        if key_col is None:
+            for c in merged.columns:
+                if str(c).strip() not in ("", "序号", "业态", "分部分项标记"):
+                    key_col = c
+                    break
+
+        if key_col and key_col in merged.columns:
+            mask = merged[key_col].notna() & (merged[key_col].astype(str).str.strip().ne(""))
+            removed = before_drop - mask.sum()
+            if removed > 0:
+                print(f"  [INFO] 已删除 {int(removed)} 行「{key_col}」为空的数据")
+            merged = merged[mask].reset_index(drop=True)
+        else:
+            merged.dropna(how="all", inplace=True)
+            merged.reset_index(drop=True, inplace=True)
 
     # 显式重排列序：同名列按基准表顺序，差异列追加到末尾
     extra_columns = [c for c in merged.columns if c not in base_columns]
@@ -622,10 +673,11 @@ def merge_sheets(
     # ---- Step 4：列审计（来源分析 + 空列删除）----
     report_df = _generate_merge_report(all_dfs, merged, list_sheet_names)
 
-    # 删除空列
+    # 删除空列（但保留增项_*列 — 用户有意创建的扩展列，即使当前无数据也应保留）
     cols_to_drop = report_df[report_df["处理"] == "物理删除"]["列名"].tolist()
     cols_to_drop = [c for c in cols_to_drop if c in merged.columns
-                    and c not in ("序号", "业态")]
+                    and c not in ("序号", "业态")
+                    and not str(c).startswith("增项_")]  # v1.3：增项列不删
     if cols_to_drop:
         merged.drop(columns=cols_to_drop, inplace=True)
         print(f"物理删除 {len(cols_to_drop)} 个空列：{[c[:20] for c in cols_to_drop[:5]]}...")
@@ -649,8 +701,13 @@ def merge_sheets(
     try:
         import tempfile
 
-        # 确定基础文件（第一个成功处理的文件）
-        base_file = processed_files[0] if processed_files else input_files[0]
+        # 确定基础文件：优先使用原始文件（保留真正含多级表头的原始清单表）
+        # 若未传 original_file，则回退到第一个成功处理的文件
+        if original_file and os.path.isfile(original_file):
+            base_file = original_file
+            print(f"  [INFO] 基底文件使用原始文件：{os.path.basename(base_file)}")
+        else:
+            base_file = processed_files[0] if processed_files else input_files[0]
 
         # 确保输出目录存在
         out_dir = os.path.dirname(output_path)
