@@ -20,6 +20,7 @@
 """
 
 import os
+import re
 import sys
 import pandas as pd
 import openpyxl
@@ -30,12 +31,13 @@ from openpyxl.utils import get_column_letter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import normalize_header_text
+from audit_logger import AuditLogger   # 新增：导入审计日志器
 
 # ===== 配置 =====
 LIST_KEYWORDS    = ["项目特征", "项目名称", "项目编码", "计量单位", "工程量"]
 MIN_HIT          = 4
-OUTPUT_SHEET     = "清单汇总"
-REPORT_SHEET     = "合并说明"
+OUTPUT_SHEET     = "清单合并"    # 原："清单汇总"
+REPORT_SHEET     = "操作记录"    # 原："合并说明"
 
 # 样式常量
 THIN_BORDER = Border(
@@ -49,6 +51,84 @@ DATA_FONT  = Font(name="微软雅黑", size=10)
 LEFT_ALIGN = Alignment(horizontal="left",    vertical="center", wrap_text=True)
 CTR_ALIGN  = Alignment(horizontal="center",  vertical="center")
 NUM_ALIGN  = Alignment(horizontal="right",   vertical="center")
+
+
+# ============================================================
+# 文件解析 & Flat 检测（Phase 1 新增）
+# ============================================================
+
+def _resolve_type_file(file_path: str, prefer_flat: bool = True) -> str:
+    """
+    自动解析输入文件路径，优先使用 header_flattener 预处理版本。
+
+    查找顺序：
+        1. {original}_type_v2.xlsx   (header_flattener v2 输出)
+        2. {original}_type.xlsx      (header_flattener v1 输出)
+        3. {original} 自身            (回退到原始文件)
+
+    Args:
+        file_path:   输入的 Excel 文件路径
+        prefer_flat: 是否优先查找 flat 版本（默认 True）
+
+    Returns:
+        解析后的实际文件路径（已验证存在）
+    """
+    base, ext = os.path.splitext(file_path)
+
+    if prefer_flat:
+        candidates = [
+            f"{base}_type_v2{ext}",
+            f"{base}_type{ext}",
+            file_path,
+        ]
+        for cand in candidates:
+            if os.path.isfile(cand):
+                if cand != file_path:
+                    print(f"  [INFO] 自动使用预处理版本：{os.path.basename(cand)}")
+                return cand
+
+    # 不 prefer flat 或所有候选都不存在 → 返回原始路径
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"文件不存在：{file_path}")
+    return file_path
+
+
+def _is_flat_header_file(ws) -> bool:
+    """
+    判断当前 Worksheet 是否为已 flatten 的单级表头文件。
+
+    检测特征（header_flattener 处理后的典型结构）：
+      - Row 1-2 为标题/副标题行（仅有 1~2 个非空单元格）
+      - 表头行含下划线连接关键词，如 "工程量_合同工程量_A"
+
+    Args:
+        ws: openpyxl Worksheet 对象
+
+    Returns:
+        bool: 是否判定为已处理的 flat 文件
+    """
+    hdr_row = get_header_row(ws, max_scan=5)
+    if hdr_row is None:
+        return False
+
+    # 特征1：Row 1 和 Row 2 只有少量非空单元格（标题行特征）
+    for check_row in [1, 2]:
+        non_empty = sum(
+            1 for c in range(1, min(ws.max_column + 1, 5))
+            if ws.cell(row=check_row, column=c).value
+        )
+        if non_empty > 2:
+            return False
+
+    # 特征2：表头行有 >=3 个列名包含 "_X_" 下划线模式（flatten 标志）
+    underline_pattern = re.compile(r'_\w+_')
+    header_texts = [
+        str(ws.cell(row=hdr_row, column=c).value or "")
+        for c in range(1, min(ws.max_column + 1, 20))
+    ]
+    flat_count = sum(1 for h in header_texts if underline_pattern.search(h))
+
+    return flat_count >= 3
 
 
 # ============================================================
@@ -270,91 +350,217 @@ def _apply_report_formatting(ws, report_df: pd.DataFrame):
 
 
 # ============================================================
-# 主处理函数
+# 主处理函数（多文件版本）
 # ============================================================
 
-def merge_sheets(input_path: str):
+def merge_sheets(
+    input_files: list,
+    output_path: str | None = None,
+    audit_logger: "AuditLogger | None" = None,
+    prefer_flat: bool = True,       # Phase 1 新增：优先使用 _type_v2 预处理文件
+):
     """
-    主处理函数：扫描清单表 → 加业态列 → 合并 → 格式标准化 → 写合并说明
+    主处理函数（多文件版）：
+        扫描所有输入文件 → 识别清单表 → 加业态列 → 合并 → 格式标准化 → 写操作记录
+
+    Args:
+        input_files:  Excel 文件路径列表（支持1个或多个文件）
+        output_path:  输出文件路径（为 None 时自动生成）
+        audit_logger: AuditLogger 实例（为 None 时内部新建）
+
+    Returns:
+        dict: {"list_sheets", "output_file", "rows", "cols", "dropped_cols"}
     """
+    # ---- 初始化审计日志器 ----
+    if audit_logger is None:
+        audit_logger = AuditLogger()
+
+    # ---- 规范化 input_files ----
+    if isinstance(input_files, str):
+        input_files = [input_files]
+
     print(f"\n{'='*60}")
-    print(f"清单表合并 v1.0 — {os.path.basename(input_path)}")
+    print(f"清单表合并 v1.1 — 多文件模式")
+    print(f"  输入文件数：{len(input_files)}")
     print(f"{'='*60}")
 
-    # Step 1: 扫描工作表
-    wb = openpyxl.load_workbook(input_path, data_only=True)
-    all_sheets = wb.sheetnames
-    list_sheets = []
-
-    for sn in all_sheets:
-        if sn in (OUTPUT_SHEET, REPORT_SHEET):
+    # ---- Step 0a：自动解析 _type_v2 预处理文件（Phase 1 新增）----
+    resolved_files = []
+    for f in input_files:
+        try:
+            resolved = _resolve_type_file(f, prefer_flat=prefer_flat)
+        except FileNotFoundError as e:
+            print(f"  [WARN] {e}")
+            audit_logger.log_error("文件解析", str(e))
             continue
-        ws = wb[sn]
-        if is_list_sheet(ws):
-            list_sheets.append(sn)
+        resolved_files.append(resolved)
 
-    if len(list_sheets) == 0:
-        print(f"[WARN] 未找到清单表（需表头命中 >= {MIN_HIT} 个关键字）")
+    input_files = resolved_files
+
+    if any("_type_v2" in f for f in input_files):
+        print("  [MODE] 检测到预处理文件（_type_v2），使用单级表头合并模式")
+
+    # ---- Step 0：审计 — 文件扫描 ----
+    audit_logger.log_file_scan(input_files, source="多文件模式")
+
+    # ---- Step 1：遍历所有文件，收集清单表 DataFrame ----
+    all_dfs          = []
+    list_sheet_names = []       # 用于列审计报告
+    all_headers      = {}       # {file_sheet: [headers]}
+    processed_files  = []       # 成功处理的文件列表
+
+    for file_idx, file_path in enumerate(input_files, 1):
+        short_name = os.path.basename(file_path)
+        print(f"\n[{file_idx}/{len(input_files)}] 处理文件：{short_name}")
+
+        if not os.path.isfile(file_path):
+            print(f"  [WARN] 文件不存在，跳过：{file_path}")
+            audit_logger.log_error("文件检查", f"文件不存在：{file_path}")
+            continue
+
+        # 用 openpyxl 识别清单表
+        try:
+            wb = openpyxl.load_workbook(file_path, data_only=True)
+        except PermissionError:
+            print(f"  [WARN] 文件被占用（PermissionError），跳过：{short_name}")
+            audit_logger.log_error("文件打开", f"文件被占用：{short_name}", file=short_name)
+            continue
+        except Exception as e:
+            print(f"  [WARN] 文件打开失败：{e}")
+            audit_logger.log_error("文件打开", str(e), file=short_name)
+            continue
+
+        sheet_names = wb.sheetnames
+        file_list_sheets = []
+
+        for sn in sheet_names:
+            if sn in (OUTPUT_SHEET, REPORT_SHEET):
+                continue
+            ws = wb[sn]
+            if not is_list_sheet(ws):
+                continue
+            file_list_sheets.append(sn)
+
+        print(f"  识别到 {len(file_list_sheets)} 个清单表：{', '.join(file_list_sheets)}")
+
+        # 逐个读取清单表
+        for sn in file_list_sheets:
+            ws = wb[sn]
+            hdr_row, headers = get_sheet_headers(ws)
+            if hdr_row is None:
+                continue
+
+            # ==== Phase 1 新增：检测 flat 文件 ====
+            is_flat = _is_flat_header_file(ws)
+
+            # 用 pandas 读数据
+            try:
+                if is_flat:
+                    # Flat 文件：openpyxl 手读单级表头 + pandas 纯读数据
+                    headers_list = [
+                        str(ws.cell(row=hdr_row, column=c).value or "").strip()
+                        for c in range(1, ws.max_column + 1)
+                    ]
+                    # 去除尾部空列
+                    while headers_list and not headers_list[-1]:
+                        headers_list.pop()
+
+                    # 跳过标题行+表头行，纯读数据
+                    df = pd.read_excel(
+                        file_path, sheet_name=sn,
+                        header=None,
+                        skiprows=range(1, hdr_row + 1),
+                    )
+                    # 手动设置列名（openpyxl 读取的单级表头）
+                    df.columns = headers_list[:len(df.columns)]
+                else:
+                    # 原始文件：使用原有逻辑
+                    df = pd.read_excel(
+                        file_path, sheet_name=sn,
+                        header=hdr_row - 1,   # pandas header 是 0-based
+                    )
+            except Exception as e:
+                print(f"  [WARN] 读取失败：{sn} — {e}")
+                audit_logger.log_error("读取工作表", str(e), file=short_name, sheet=sn)
+                continue
+
+            # 只保留有效列名（非空列）
+            valid_cols = [c for c in df.columns if str(c).strip() not in ("", "nan")]
+            df = df[valid_cols].copy()
+
+            # 重命名 Unnamed 列
+            df = _rename_unnamed_columns(df)
+
+            # 过滤重复表头行
+            for col in list(df.columns):
+                if _is_header_duplicate(df, col):
+                    df = df[df[col] != col]
+
+            # 加业态列（值 = 工作表全名）
+            # Phase 1：如果 flat 文件已含业态列，不重复插入
+            if "业态" not in df.columns:
+                df.insert(0, "业态", sn)
+            # else: _type_v2 文件已有业态列（header_flattener 填入），保持原值
+
+            # 记录
+            all_dfs.append(df)
+            list_sheet_names.append(f"{short_name}_{sn}")
+            all_headers[f"{short_name}_{sn}"] = df.columns.tolist()
+
+            row_count = len(df)
+            col_count = len(df.columns)
+            print(f"  [{sn}] {row_count}行 x {col_count}列")
+
+            # 审计日志
+            audit_logger.log_sheet_detect(
+                short_name, sn, df.columns.tolist(), row_count,
+                hit_keywords=["序号", "项目编码", "项目名称", "项目特征", "计量单位"],
+            )
+
         wb.close()
-        return
+        if file_list_sheets:
+            processed_files.append(file_path)
 
-    print(f"\n识别到 {len(list_sheets)} 个清单表：")
-    for sn in list_sheets:
-        print(f"  - {sn}")
+    # ---- 检查：是否找到清单表 ----
+    if len(all_dfs) == 0:
+        msg = "未找到任何清单表（需表头命中 >= {MIN_HIT} 个关键字）"
+        print(f"\n[ERROR] {msg}")
+        audit_logger.log_error("清单表识别", msg)
+        return {"list_sheets": [], "output_file": None, "rows": 0, "cols": 0, "dropped_cols": 0}
 
-    # Step 2: 逐个读取清单表 DataFrame
-    all_dfs = []
-    sheet_short_names = []
+    print(f"\n共识别 {len(all_dfs)} 个清单表，开始合并...")
 
-    for sn in list_sheets:
-        ws = wb[sn]
-        hdr_row, headers = get_sheet_headers(ws)
-        if hdr_row is None:
-            continue
+    # ---- Step 2：审计 — 表头对比 ----
+    audit_logger.log_header_compare(all_headers)
 
-        # 读取数据（跳过表头行之前的所有行）
-        df = pd.read_excel(
-            input_path, sheet_name=sn,
-            header=hdr_row - 1,  # pandas header 是0-based
-        )
-        # 只保留有效列名（非空列）
-        valid_cols = [c for c in df.columns if str(c).strip() not in ("", "nan")]
-        df = df[valid_cols].copy()
+    # ---- Step 3：合并（基准列序锁定 + pd.concat outer join）----
+    # Phase 1：锁定第一个 df 的列序作为基准
+    base_columns = all_dfs[0].columns.tolist()
 
-        # 重命名 Unnamed 列
-        df = _rename_unnamed_columns(df)
-
-        # 过滤重复表头行
-        for col in list(df.columns):
-            if _is_header_duplicate(df, col):
-                df = df[df[col] != col]
-
-        # 加业态列
-        short = sn
-        for prefix in ["表-08 分部分项工程和单价措施项目清单-", "表-08 ", "表"]:
-            if short.startswith(prefix):
-                short = short[len(prefix):]
-                break
-        df.insert(0, "业态", short)
-        sheet_short_names.append(short)
-
-        all_dfs.append(df)
-        print(f"  [{sn}] {len(df)}行 x {len(df.columns)}列")
-
-    wb.close()
-
-    # Step 3: 合并
     merged = pd.concat(all_dfs, join="outer", ignore_index=True, sort=False)
 
-    # 重新编号：先删源表自带的序号列，再统一插入1-based编号
+    # 显式重排列序：同名列按基准表顺序，差异列追加到末尾
+    extra_columns = [c for c in merged.columns if c not in base_columns]
+    merged = merged[base_columns + extra_columns]
+
+    # 重新编号：先删源表自带的序号列，再统一插入 1-based 编号
     if "序号" in merged.columns:
         merged.drop(columns=["序号"], inplace=True)
     merged.insert(0, "序号", range(1, len(merged) + 1))
 
     print(f"\n合并结果：{merged.shape[0]}行 x {merged.shape[1]}列")
 
-    # Step 4: 列审计
-    report_df = _generate_merge_report(all_dfs, merged, list_sheets)
+    # ---- Step 3b：审计 — 合并结果 ----
+    # 计算新增的差异列
+    all_col_sets = [set(df.columns) for df in all_dfs]
+    common_cols  = set.intersection(*all_col_sets) if all_col_sets else set()
+    unique_cols  = set.union(*all_col_sets) - common_cols if all_col_sets else set()
+    added_cols   = sorted(unique_cols)
+
+    audit_logger.log_merge_result(merged, added_cols=list(added_cols))
+
+    # ---- Step 4：列审计（来源分析 + 空列删除）----
+    report_df = _generate_merge_report(all_dfs, merged, list_sheet_names)
 
     # 删除空列
     cols_to_drop = report_df[report_df["处理"] == "物理删除"]["列名"].tolist()
@@ -366,53 +572,60 @@ def merge_sheets(input_path: str):
 
     print(f"最终：{merged.shape[0]}行 x {merged.shape[1]}列")
 
-    # Step 5: 写入 Excel
-    output_path = input_path
+    # ---- Step 5：确定输出路径 ----
+    if output_path is None:
+        # 自动生成：取第一个文件名 + "_清单合并.xlsx"
+        first_name = os.path.splitext(os.path.basename(input_files[0]))[0]
+        output_path = os.path.join(os.path.dirname(input_files[0]), f"{first_name}_清单合并.xlsx")
+
+    # 若输出文件已存在，自动重命名
+    base, ext = os.path.splitext(output_path)
+    counter = 2
+    while os.path.exists(output_path):
+        output_path = f"{base}_v{counter}{ext}"
+        counter += 1
+
+    # ---- Step 6：写入 Excel（独立新文件）----
     try:
-        with pd.ExcelWriter(output_path, engine="openpyxl",
-                            mode="a", if_sheet_exists="replace") as writer:
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             merged.to_excel(writer, sheet_name=OUTPUT_SHEET, index=False)
-            report_df.to_excel(writer, sheet_name=REPORT_SHEET, index=False)
+            audit_df = audit_logger.get_dataframe()
+            audit_df.to_excel(writer, sheet_name=REPORT_SHEET, index=False)
 
         # 格式标准化
         wb = openpyxl.load_workbook(output_path)
+
         ws_output = wb[OUTPUT_SHEET]
         _apply_list_merge_formatting(ws_output)
 
         ws_report = wb[REPORT_SHEET]
-        _apply_report_formatting(ws_report, report_df)
+        _apply_report_formatting(ws_report, audit_logger.get_dataframe())
 
         wb.save(output_path)
         wb.close()
-        print(f"\n[OK] 已保存到原文件：{os.path.basename(output_path)}")
 
-    except PermissionError:
-        base, ext = os.path.splitext(input_path)
-        output_path = f"{base}_含清单汇总{ext}"
-        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            merged.to_excel(writer, sheet_name=OUTPUT_SHEET, index=False)
-            report_df.to_excel(writer, sheet_name=REPORT_SHEET, index=False)
+        print(f"\n[OK] 已保存到独立文件：{os.path.basename(output_path)}")
+        audit_logger.log_output(output_path, [OUTPUT_SHEET, REPORT_SHEET])
+        audit_logger.log_format_apply(OUTPUT_SHEET)
+        audit_logger.log_format_apply(REPORT_SHEET)
 
-        wb = openpyxl.load_workbook(output_path)
-        ws_output = wb[OUTPUT_SHEET]
-        _apply_list_merge_formatting(ws_output)
-        ws_report = wb[REPORT_SHEET]
-        _apply_report_formatting(ws_report, report_df)
-        wb.save(output_path)
-        wb.close()
-        print(f"\n[OK] 原文件被占用，已另存为：{os.path.basename(output_path)}")
+    except Exception as e:
+        print(f"\n[ERROR] 写入文件失败：{e}")
+        audit_logger.log_error("写文件", str(e), remark=output_path)
+        raise
 
-    # Step 6: 汇总
+    # ---- Step 7：汇总 ----
     print(f"\n{'='*60}")
     print(f"处理完成！")
-    print(f"  清单表数：{len(list_sheets)}")
+    print(f"  清单表数：{len(all_dfs)}")
+    print(f"  输入文件：{len(processed_files)} 个")
     print(f"  输出：{os.path.basename(output_path)}")
     print(f"  Sheets：{OUTPUT_SHEET} ({merged.shape[0]}行x{merged.shape[1]}列)")
-    print(f"         {REPORT_SHEET} ({len(report_df)}列说明)")
+    print(f"         {REPORT_SHEET} ({len(audit_logger.records)} 条记录)")
     print(f"{'='*60}\n")
 
     return {
-        "list_sheets": list_sheets,
+        "list_sheets": list_sheet_names,
         "output_file": output_path,
         "rows": merged.shape[0],
         "cols": merged.shape[1],
@@ -421,15 +634,16 @@ def merge_sheets(input_path: str):
 
 
 # ============================================================
-# CLI 入口
+# CLI 入口（多文件支持）
 # ============================================================
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("用法: python sheet_merger.py <输入Excel>")
+        print("用法: python sheet_merger.py <输入Excel1> [输入Excel2] ...")
     else:
-        input_path = sys.argv[1]
-        if not os.path.exists(input_path):
-            print(f"[ERROR] 文件不存在：{input_path}")
-            sys.exit(1)
-        merge_sheets(input_path)
+        input_files = sys.argv[1:]
+        for f in input_files:
+            if not os.path.exists(f):
+                print(f"[ERROR] 文件不存在：{f}")
+                sys.exit(1)
+        merge_sheets(input_files)

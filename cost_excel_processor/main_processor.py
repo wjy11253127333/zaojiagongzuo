@@ -56,6 +56,11 @@ class CostExcelProcessor:
         self.enable_rule_matching = False   # 是否启用企业规则匹配（默认关闭，日后配置）
         self.skipped_sheets = []            # 被跳过的非清单表
 
+        # 清单合并配置（新增 v1.1）
+        self.enable_merge     = False       # 是否启用清单表多文件合并
+        self.merge_input_files = []         # 合并输入文件列表（为空时用当前文件）
+        self.merge_output_path = None       # 合并输出路径（None 时自动生成）
+
     def log(self, msg: str):
         """记录处理日志"""
         self.logs.append(msg)
@@ -335,3 +340,44 @@ class CostExcelProcessor:
             "skipped_sheets": len(self.skipped_sheets),
             "enable_rule_matching": self.enable_rule_matching,
         }
+
+    # ============================================================
+    # 清单表多文件合并（新增 v1.1）
+    # ============================================================
+
+    def run_merge(self, output_path: str | None = None):
+        """
+        执行清单表多文件合并（可选步骤，在 process() 之后调用）
+        
+        Args:
+            output_path: 合并输出路径（None 时自动生成）
+
+        Returns:
+            dict: 合并结果 {"list_sheets", "output_file", "rows", "cols", ...}
+        """
+        from audit_logger import AuditLogger
+        from sheet_merger import merge_sheets
+
+        # 确定输入文件列表
+        input_files = self.merge_input_files or [self.file_path]
+        if not input_files:
+            raise ValueError("无输入文件可合并")
+
+        # 确定输出路径
+        out_path = output_path or self.merge_output_path
+
+        # 初始化审计日志器
+        logger = AuditLogger()
+
+        print(f"\n{'='*60}")
+        print(f"  执行清单合并步骤...")
+        print(f"{'='*60}")
+
+        result = merge_sheets(
+            input_files=input_files,
+            output_path=out_path,
+            audit_logger=logger,
+        )
+
+        self.log(f"清单合并完成：{result['rows']}行 x {result['cols']}列 → {result.get('output_file', '?')}")
+        return result
